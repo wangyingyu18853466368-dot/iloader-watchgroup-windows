@@ -1,0 +1,413 @@
+diff --git a/vendor/isideload/isideload/src/anisette/remote_v3/mod.rs b/vendor/isideload/isideload/src/anisette/remote_v3/mod.rs
+index 8f7e59c..32734a6 100644
+--- a/vendor/isideload/isideload/src/anisette/remote_v3/mod.rs
++++ b/vendor/isideload/isideload/src/anisette/remote_v3/mod.rs
+@@ -25,16 +25,29 @@ use crate::{SideloadError, anisette::remote_v3::websocket::AppWebSocket};
+ 
+ pub const DEFAULT_ANISETTE_V3_URL: &str = "https://ani.stikstore.app";
+ 
++// Public Mac anisette services still advertise this legacy identity. Apple can
++// reject it with -23782 before password verification. Preserve the exact
++// compatible header pair from upstream fork.2 for this known legacy response;
++// other server identities remain dynamic. This changes no account credentials,
++// provisioning state, TLS validation, or Apple-issued signing permissions.
++const LEGACY_MAC_CLIENT_INFO: &str =
++    "<MacBookPro13,3> <Mac OS X;10.12.6;16G29> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
++const FORK_CLIENT_INFO: &str =
++    "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
++const FORK_USER_AGENT: &str = "akd/1.0 CFNetwork/808.1.4";
++
+ /// Fixed service endpoints; URL construction performs no network access.
+ #[derive(Clone, Copy)]
+ pub enum Endpoint {
+     Headers,
+     Provisioning,
++    ClientInfo,
+ }
+ pub fn endpoint_url(base: &str, endpoint: Endpoint) -> Result<reqwest::Url, Report> {
+     let suffix = match endpoint {
+         Endpoint::Headers => "get_headers",
+         Endpoint::Provisioning => "provisioning_session",
++        Endpoint::ClientInfo => "client_info",
+     };
+     let mut url = reqwest::Url::parse(base)?;
+     if !matches!(url.scheme(), "https" | "http")
+@@ -62,6 +75,7 @@ pub struct RemoteV3AnisetteProvider {
+     serial_number: String,
+     client: reqwest_middleware::ClientWithMiddleware,
+     websocket_proxy: Option<String>,
++    client_info: tokio::sync::OnceCell<AnisetteClientInfo>,
+ }
+ 
+ impl RemoteV3AnisetteProvider {
+@@ -83,6 +97,7 @@ impl RemoteV3AnisetteProvider {
+             serial_number,
+             client: Self::build_reqwest_client(None)?,
+             websocket_proxy: None,
++            client_info: tokio::sync::OnceCell::new(),
+         })
+     }
+ 
+@@ -120,6 +135,7 @@ impl RemoteV3AnisetteProvider {
+ 
+     pub fn set_url(mut self, url: &str) -> RemoteV3AnisetteProvider {
+         self.url = url.to_string();
++        self.client_info = tokio::sync::OnceCell::new();
+         self
+     }
+ 
+@@ -190,12 +206,35 @@ impl AnisetteProvider for RemoteV3AnisetteProvider {
+     }
+ 
+     async fn get_client_info(&self) -> Result<AnisetteClientInfo, Report> {
+-        Ok(AnisetteClientInfo {
+-            client_info:
+-                "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+-                    .to_string(),
+-            user_agent: "akd/1.0 CFNetwork/808.1.4".to_string(),
+-        })
++        let info = self
++            .client_info
++            .get_or_try_init(|| async {
++                let info: AnisetteClientInfo = self
++                    .client
++                    .get(endpoint_url(&self.url, Endpoint::ClientInfo)?)
++                    .timeout(std::time::Duration::from_secs(20))
++                    .send()
++                    .await
++                    .context("Failed to retrieve current anisette client information")?
++                    .error_for_status()?
++                    .json()
++                    .await?;
++                if info.client_info.trim().is_empty() || info.user_agent.trim().is_empty() {
++                    bail!("Anisette server returned empty client information");
++                }
++                let info = if info.client_info == LEGACY_MAC_CLIENT_INFO {
++                    info!("服务报告 macOS 10.12.6，已启用 fork.2 登录兼容信息（-23782 修复）。");
++                    AnisetteClientInfo {
++                        client_info: FORK_CLIENT_INFO.into(),
++                        user_agent: FORK_USER_AGENT.into(),
++                    }
++                } else {
++                    info
++                };
++                Ok::<_, Report>(info)
++            })
++            .await?;
++        Ok(info.clone())
+     }
+ 
+     fn needs_provisioning(&self) -> Result<bool, Report> {
+@@ -485,9 +524,112 @@ mod endpoint_tests {
+             "https://user:secret@example.invalid",
+             "ftp://example.invalid",
+         ] {
+-            for endpoint in [Endpoint::Headers, Endpoint::Provisioning] {
++            for endpoint in [
++                Endpoint::Headers,
++                Endpoint::Provisioning,
++                Endpoint::ClientInfo,
++            ] {
+                 assert!(endpoint_url(base, endpoint).is_err());
+             }
+         }
+     }
++
++    // Synthetic loopback data only: no Apple account, keyring or remote service.
++    async fn fixture(
++        body: &str,
++        status: u16,
++    ) -> (RemoteV3AnisetteProvider, tokio::task::JoinHandle<()>) {
++        use tokio::{
++            io::{AsyncReadExt, AsyncWriteExt},
++            net::TcpListener,
++        };
++        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let address = listener.local_addr().unwrap();
++        let response = format!(
++            "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
++            body.len()
++        );
++        let server = tokio::spawn(async move {
++            let (mut socket, _) = listener.accept().await.unwrap();
++            let mut bytes = vec![0; 4096];
++            let count = socket.read(&mut bytes).await.unwrap();
++            assert!(
++                String::from_utf8_lossy(&bytes[..count])
++                    .starts_with("GET /prefix/v3/client_info HTTP/1.1\r\n")
++            );
++            socket.write_all(response.as_bytes()).await.unwrap();
++            socket.shutdown().await.unwrap();
++        });
++        let mut provider = RemoteV3AnisetteProvider::new(
++            &format!("http://{address}/prefix/"),
++            Box::new(crate::util::storage::InMemoryStorage::new()),
++            "0".into(),
++        )
++        .unwrap();
++        provider.client =
++            MwClientBuilder::new(ClientBuilder::new().no_proxy().build().unwrap()).build();
++        (provider, server)
++    }
++
++    #[tokio::test]
++    async fn client_identity_comes_from_server_and_cache_is_cleared_on_server_change() {
++        let (provider, server) = fixture(
++            r#"{"client_info":"fixture identity A","user_agent":"fixture agent A"}"#,
++            200,
++        )
++        .await;
++        assert_eq!(
++            provider.get_client_info().await.unwrap().client_info,
++            "fixture identity A"
++        );
++        server.await.unwrap();
++        // Listener is now closed; this succeeds only when the cached identity is reused.
++        assert_eq!(
++            provider.get_client_info().await.unwrap().user_agent,
++            "fixture agent A"
++        );
++        let (second, second_server) = fixture(
++            r#"{"client_info":"fixture identity B","user_agent":"fixture agent B"}"#,
++            200,
++        )
++        .await;
++        let provider = provider.set_url(&second.url);
++        assert_eq!(
++            provider.get_client_info().await.unwrap().client_info,
++            "fixture identity B"
++        );
++        second_server.await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn known_legacy_mac_response_uses_the_upstream_fork_header_pair_consistently() {
++        let body = serde_json::json!({
++            "client_info": LEGACY_MAC_CLIENT_INFO,
++            "user_agent": "akd/1.0 CFNetwork/811.5.4 Darwin/16.7.0"
++        })
++        .to_string();
++        let (provider, server) = fixture(&body, 200).await;
++        let info = provider.get_client_info().await.unwrap();
++        assert_eq!(info.client_info, FORK_CLIENT_INFO);
++        assert_eq!(info.user_agent, FORK_USER_AGENT);
++        assert!(!info.client_info.contains("10.12.6"));
++        server.await.unwrap();
++        let cached = provider.get_client_info().await.unwrap();
++        assert_eq!(cached.client_info, info.client_info);
++        assert_eq!(cached.user_agent, info.user_agent);
++    }
++
++    #[tokio::test]
++    async fn invalid_or_failed_client_info_does_not_fall_back_to_fabricated_identity() {
++        for (body, status) in [
++            (r#"{"client_info":"","user_agent":"agent"}"#, 200),
++            (r#"{"client_info":"identity","user_agent":" "}"#, 200),
++            ("not JSON", 200),
++            (r#"{"client_info":"identity","user_agent":"agent"}"#, 503),
++        ] {
++            let (provider, server) = fixture(body, status).await;
++            assert!(provider.get_client_info().await.is_err());
++            server.await.unwrap();
++        }
++    }
+ }
+diff --git a/vendor/isideload/isideload/src/dev/app_groups.rs b/vendor/isideload/isideload/src/dev/app_groups.rs
+index 00db3b9..cb2054c 100644
+--- a/vendor/isideload/isideload/src/dev/app_groups.rs
++++ b/vendor/isideload/isideload/src/dev/app_groups.rs
+@@ -1,7 +1,7 @@
+ use crate::dev::{
+     app_ids::AppId,
+     developer_session::DeveloperSession,
+-    device_type::{DeveloperDeviceType, dev_url},
++    device_type::{DeveloperDeviceType, apply_platform_to_body, dev_url},
+     normalize_app_names,
+     teams::DeveloperTeam,
+ };
+@@ -78,11 +78,13 @@ pub trait AppGroupsApi {
+         app_id: &AppId,
+         device_type: impl Into<Option<DeveloperDeviceType>> + Send,
+     ) -> Result<(), Report> {
+-        let body = plist!(dict {
++        let device_type = device_type.into();
++        let mut body = plist!(dict {
+             "teamId": &team.team_id,
+             "applicationGroups": &app_group.application_group,
+             "appIdId": &app_id.app_id_id,
+         });
++        apply_platform_to_body(&mut body, &device_type);
+ 
+         self.developer_session()
+             .send_dev_request_no_response(
+diff --git a/vendor/isideload/isideload/src/dev/app_ids.rs b/vendor/isideload/isideload/src/dev/app_ids.rs
+index c1f5dba..a064ecd 100644
+--- a/vendor/isideload/isideload/src/dev/app_ids.rs
++++ b/vendor/isideload/isideload/src/dev/app_ids.rs
+@@ -5,7 +5,7 @@ use crate::{
+         normalize_app_names,
+         teams::DeveloperTeam,
+     },
+-    util::plist::{PlistDataExtract, SensitivePlistAttachment},
++    util::plist::SensitivePlistAttachment,
+ };
+ use plist::{Data, Date, Dictionary, Value};
+ use plist_macro::plist;
+@@ -241,14 +241,29 @@ impl AppId {
+         dev_session: &mut DeveloperSession,
+         team: &DeveloperTeam,
+     ) -> Result<(), Report> {
+-        let app_group_feature_enabled = self.features.get_bool("APG3427HIY")?;
++        self.ensure_group_feature_for_platform(dev_session, team, None)
++            .await
++    }
++
++    /// Watch App IDs must carry the same platform marker used to register them.
++    pub async fn ensure_group_feature_for_platform(
++        &mut self,
++        dev_session: &mut DeveloperSession,
++        team: &DeveloperTeam,
++        device_type: Option<DeveloperDeviceType>,
++    ) -> Result<(), Report> {
++        let app_group_feature_enabled = self
++            .features
++            .get("APG3427HIY")
++            .and_then(Value::as_boolean)
++            .unwrap_or(false);
+ 
+         if !app_group_feature_enabled {
+             let body = plist!(dict {
+                 "APG3427HIY": true,
+             });
+             let new_features = dev_session
+-                .update_app_id(team, self, body, None)
++                .update_app_id(team, self, body, device_type)
+                 .await?
+                 .features;
+             self.features = new_features;
+diff --git a/vendor/isideload/isideload/src/sideload/sideloader.rs b/vendor/isideload/isideload/src/sideload/sideloader.rs
+index 9cce50b..2e2a521 100644
+--- a/vendor/isideload/isideload/src/sideload/sideloader.rs
++++ b/vendor/isideload/isideload/src/sideload/sideloader.rs
+@@ -151,19 +151,32 @@ impl Sideloader {
+             .await?;
+ 
+         for app_id in app_ids.iter_mut() {
+-            if watch_bundle_ids.contains(&app_id.identifier) {
+-                continue;
+-            }
++            let is_watch = watch_bundle_ids.contains(&app_id.identifier);
++            let device_type = is_watch.then_some(DeveloperDeviceType::Watchos);
+ 
+             app_id
+-                .ensure_group_feature(&mut self.dev_session, &team)
+-                .await?;
++                .ensure_group_feature_for_platform(
++                    &mut self.dev_session,
++                    &team,
++                    device_type.clone(),
++                )
++                .await
++                .context(if is_watch {
++                    "Failed to enable App Groups for the Watch App ID"
++                } else {
++                    "Failed to enable App Groups for the iPhone App ID"
++                })?;
+ 
+             self.dev_session
+-                .assign_app_group(&team, &app_group, app_id, None)
+-                .await?;
++                .assign_app_group(&team, &app_group, app_id, device_type)
++                .await
++                .context(if is_watch {
++                    "Failed to associate the Watch App ID with its App Group"
++                } else {
++                    "Failed to associate the iPhone App ID with its App Group"
++                })?;
+ 
+-            if increased_memory_limit {
++            if increased_memory_limit && !is_watch {
+                 self.dev_session
+                     .add_increased_memory_limit(&team, app_id)
+                     .await?;
+@@ -211,6 +224,11 @@ impl Sideloader {
+             let parsed_profile = ProvisioningProfile::parse(profile.encoded_profile.as_ref())?;
+             let entitlements = parsed_profile.entitlements().clone();
+ 
++            if watch_bundle_ids.contains(&bundle_id) {
++                validate_watch_app_group(&bundle_id, &entitlements, &group_identifier)?;
++                info!("Watch App Group verified in Apple-issued provisioning profile");
++            }
++
+             provisioning_profiles.push((bundle_id, profile, entitlements));
+         }
+ 
+@@ -387,3 +405,68 @@ impl Sideloader {
+         &self.apple_email
+     }
+ }
++
++/// Reject a stale or insufficient profile before signing or transferring either app.
++fn validate_watch_app_group(
++    bundle_id: &str,
++    entitlements: &Dictionary,
++    expected_group: &str,
++) -> Result<(), Report> {
++    let authorized = entitlements
++        .get("com.apple.security.application-groups")
++        .and_then(plist::Value::as_array)
++        .is_some_and(|groups| {
++            groups
++                .iter()
++                .any(|group| group.as_string() == Some(expected_group))
++        });
++    if !authorized {
++        bail!(
++            "Apple's provisioning profile for Watch app {bundle_id} does not authorize the requested App Group. Installation stopped before transfer; changing local entitlements alone cannot grant this permission."
++        );
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod watch_app_group_tests {
++    use super::*;
++    use plist::Value;
++
++    #[test]
++    fn missing_or_wrong_watch_group_stops_installation() {
++        let mut entitlements = Dictionary::new();
++        assert!(
++            validate_watch_app_group("app.watchkitapp", &entitlements, "group.expected").is_err()
++        );
++        entitlements.insert(
++            "com.apple.security.application-groups".into(),
++            Value::Array(vec![Value::String("group.other-team".into())]),
++        );
++        assert!(
++            validate_watch_app_group("app.watchkitapp", &entitlements, "group.expected").is_err()
++        );
++        entitlements.insert(
++            "com.apple.security.application-groups".into(),
++            Value::String("group.expected".into()),
++        );
++        assert!(
++            validate_watch_app_group("app.watchkitapp", &entitlements, "group.expected").is_err()
++        );
++    }
++
++    #[test]
++    fn exact_watch_group_is_accepted_among_multiple_authorized_groups() {
++        let mut entitlements = Dictionary::new();
++        entitlements.insert(
++            "com.apple.security.application-groups".into(),
++            Value::Array(vec![
++                Value::String("group.unrelated".into()),
++                Value::String("group.expected".into()),
++            ]),
++        );
++        assert!(
++            validate_watch_app_group("app.watchkitapp", &entitlements, "group.expected").is_ok()
++        );
++    }
++}

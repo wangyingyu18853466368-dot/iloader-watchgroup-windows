@@ -1,0 +1,48 @@
+{
+  "version": "2.3.4-watchgroup.2",
+  "based_on": "https://github.com/AndreySemjonov/iloader",
+  "upstream_tag": "v2.3.4-fork.2",
+  "upstream_commit": "2d13485ef2d7107b2bc2ec6cdb5f54ce5729ef70",
+  "build_time": "2026-11-12T10:03:54.215223+08:00",
+  "target": "x86_64-pc-windows-gnu",
+  "rustc": "1.99.1 (58cf8f9c3 2026-10-15)",
+  "gcc": "13.2.0 (Strawberry Perl portable 5.42.3.1)",
+  "build_command": "cargo build --release --manifest-path iloader-cli/Cargo.toml --locked --offline",
+  "profile": {
+    "strip": true,
+    "lto": "thin"
+  },
+  "apple_codesign_commit": "5da0b8df9b202434b1eff2700059b1ee142592ac",
+  "validation": {
+    "cli_tests": 5,
+    "backend_tests": 18,
+    "failed": 0,
+    "clean_path_launch": true,
+    "original_ipa_check": true,
+    "public_anisette_service_check": true,
+    "apple_account_login_tested": false,
+    "watch_install_tested": false,
+    "check_launcher": true,
+    "start_launcher_error_path": true
+  },
+  "source_sha256": {
+    "iloader-cli/Cargo.toml": "d5ab786f3ecb5e715be5ae8de36ca21e6248c9eaa7bd8462272670eb2dced0df",
+    "iloader-cli/README.md": "4a7430e3db0db82483b697199fbdd8d480231206b8fd7883c859e6770f7587df",
+    "iloader-cli/Start.cmd": "8d4785bc43eacd9fbf69f786d730d94ed7ee1bed42d21190838dedd9fb6f26cb",
+    "vendor/isideload/isideload/src/anisette/remote_v3/mod.rs": "27e371aa97721704a9dec535831270f09331ccb2e79583714c8d5b82b09dfdfd",
+    "iloader-cli/Check.cmd": "a7abcbfe5895a693074506ba0c10974ab7fed653682f8e7bda0fda4cfa3c4ee4",
+    "vendor/isideload/isideload/src/dev/app_groups.rs": "63bcf5be3ebe5743358a1a3cb20895df7aed8746545f7bb782089dfc54cd69b5",
+    "vendor/isideload/isideload/src/dev/app_ids.rs": "96bebfba63d77bfb16ef48fcf19ba3a486990dd9ef16a478054121dcb6b8ed54",
+    "iloader-cli/src/ipa.rs": "302c1fc24c4868b952d0e8c9c0517a550eb2445c77f66c3d552e309674c0ba16",
+    "iloader-cli/Cargo.lock": "cdfdc69a24d4a0d685d41a9c8fd55982ac89e0d959aa1b4066e5a0ef5df4f030",
+    "iloader-cli/src/main.rs": "2a5d570eee315f8a68b25e1391269c69d6804d45a9c1660109c249e0ee80379a",
+    "vendor/isideload/isideload/src/sideload/sideloader.rs": "f28ff182123dff9171dc11f52a18eeed6ff8b8ee6dfee21e239295297d0d0de1",
+    "iloader-cli/Check-login.cmd": "5ce260ac5bf517c9e1cd365647677e1433648f9b063af34da3526242eb9a9f08"
+  },
+  "executable_sha256": "f10180a7e53c265e3f5de7cb2e8e7e05c308ecee1316775bbc20416fea1cf44b",
+  "ipa_sha256": "5b7894cf38ad7f4cbe08743e4fed41db8b3f06b133c90db8aa02f43ef1e66092",
+  "changes_since_watchgroup_1": [
+    "Restore fork.2 compatible client header pair for the known macOS 10.12.6 anisette response",
+    "Add account-free --check-login-service diagnostic and visible startup version"
+  ]
+}
